@@ -1,6 +1,6 @@
 # StockOpenerGUI.ps1 - Neon terminal GUI; single persistent Firefox window
 # First ticker: open Yahoo + Zacks + Finviz together in one window
-# Later tickers: reuse same window; Zacks + Finviz first, Yahoo last (active tab)
+# Later tickers: open new window with same three tabs in the same order
 
 $ErrorActionPreference = 'Stop'
 
@@ -216,6 +216,7 @@ $OpenBtn.Add_Click({
 
 # Show the window (modal)
 $null = $window.ShowDialog()
+
 
 
 
