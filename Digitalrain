@@ -1,0 +1,471 @@
+﻿# StockOpenerGUI.ps1 - Neon terminal GUI; persistent Firefox profile
+# Each ticker: open Yahoo + Zacks + Finviz together in a new window (Yahoo focused)
+# Uses the same 'StockOpener' Firefox profile every time; welcome suppressed
+
+$ErrorActionPreference = 'Stop'
+
+function Get-FirefoxPath {
+  $candidates = @(
+    "$env:ProgramFiles\Mozilla Firefox\firefox.exe",
+    "$env:ProgramFiles(x86)\Mozilla Firefox\firefox.exe"
+  )
+  foreach ($p in $candidates) { if (Test-Path $p) { return $p } }
+  throw "Firefox not found. Edit Get-FirefoxPath() to point to firefox.exe."
+}
+
+# 1) Locate Firefox
+$Firefox = Get-FirefoxPath
+
+# 2) Ensure StockOpener profile (fixed path so prefs persist)
+$ProfileDir = Join-Path $env:APPDATA 'Mozilla\Firefox\Profiles\StockOpener'
+if (-not (Test-Path $ProfileDir)) { New-Item -ItemType Directory -Path $ProfileDir -Force | Out-Null }
+& $Firefox -CreateProfile "StockOpener $ProfileDir" | Out-Null
+
+# 3) Enforce prefs: tab behavior + suppress welcome/first-run
+$userJs = @"
+user_pref("browser.link.open_newwindow", 3);
+user_pref("browser.link.open_newwindow.restriction", 0);
+// Keep additional tabs in background so Yahoo stays focused
+user_pref("browser.tabs.loadInBackground", true);
+user_pref("browser.tabs.loadDivertedInBackground", true);
+// Append tabs at the end to preserve Yahoo, Zacks, Finviz order
+user_pref("browser.tabs.insertRelatedAfterCurrent", false);
+user_pref("browser.tabs.insertAfterCurrent", false);
+// Tame first-run noise
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("browser.sessionstore.resume_from_crash", false);
+// Suppress about:welcome and any first-run homepage overrides
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("trailhead.firstrun.didSeeAboutWelcome", true);
+user_pref("startup.homepage_welcome_url", "");
+user_pref("startup.homepage_welcome_url.additional", "");
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("browser.startup.homepage", "about:blank");
+user_pref("browser.startup.page", 1);
+// Trust Windows cert store (prevents TLS issues with AV/proxies)
+user_pref("security.enterprise_roots.enabled", true);
+"@
+Set-Content -Encoding ASCII -Path (Join-Path $ProfileDir 'user.js') -Value $userJs
+
+# 3.5) Ensure no other Firefox is running (we will start on first ticker)
+function Ensure-StockOpenerInstance {
+  while (Get-Process -Name firefox -ErrorAction SilentlyContinue) {
+    $res = [System.Windows.MessageBox]::Show(
+      "Please close ALL Firefox windows, then click OK to continue.",
+      "Firefox is running",
+      'OKCancel',
+      'Warning'
+    )
+    if ($res -eq 'Cancel') { throw 'Canceled due to running Firefox processes.' }
+  }
+}
+
+# Bring the just-opened Firefox window to the foreground
+function Focus-FirefoxWindow([string]$Ticker) {
+  try {
+    $shell = New-Object -ComObject WScript.Shell
+    for ($i = 0; $i -lt 15; $i++) {
+      # Prefer matching the Yahoo title which starts with the ticker (e.g., "AAPL - ... - Yahoo Finance")
+      if ($Ticker) {
+        if ($shell.AppActivate($Ticker)) { return }
+      }
+      # Generic Firefox window title match
+      if ($shell.AppActivate('Mozilla Firefox')) { return }
+      if ($shell.AppActivate('Yahoo Finance')) { return }
+
+      # Fallback: activate the main Firefox window by PID
+      $proc = Get-Process -Name firefox -ErrorAction SilentlyContinue |
+              Where-Object { $_.MainWindowHandle -ne 0 } |
+              Select-Object -First 1
+      if ($proc) {
+        if ($shell.AppActivate([int]$proc.Id)) { return }
+      }
+      Start-Sleep -Milliseconds 150
+    }
+  } catch {}
+}
+
+# Win32 helpers to enumerate top-level windows and bring top Firefox window to front
+if (-not ('Win32.NativeMethods' -as [type])) {
+  Add-Type -Language CSharp -TypeDefinition @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+
+namespace Win32 {
+  public static class NativeMethods {
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder sb, int maxCount);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder sb, int maxCount);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  }
+}
+"@
+}
+
+function Get-FirefoxWindows {
+  $handles = New-Object System.Collections.Generic.List[System.IntPtr]
+  $cb = [Win32.NativeMethods+EnumWindowsProc]{ param([IntPtr]$h,[IntPtr]$p)
+    if ([Win32.NativeMethods]::IsWindowVisible($h)) {
+      $cls = New-Object System.Text.StringBuilder 256
+      [void][Win32.NativeMethods]::GetClassName($h, $cls, $cls.Capacity)
+      if ($cls.ToString() -eq 'MozillaWindowClass') { $handles.Add($h) }
+    }
+    return $true
+  }
+  [void][Win32.NativeMethods]::EnumWindows($cb, [IntPtr]::Zero)
+  return $handles
+}
+
+function Focus-TopFirefoxWindow {
+  try {
+    $wins = Get-FirefoxWindows
+    if ($wins.Count -gt 0) {
+      $h = $wins[0]
+      # Restore if minimized (SW_RESTORE = 9)
+      if ([Win32.NativeMethods]::IsIconic($h)) { [void][Win32.NativeMethods]::ShowWindow($h, 9) }
+      [void][Win32.NativeMethods]::SetForegroundWindow($h)
+      return $true
+    }
+  } catch {}
+  # Fallback to COM-based focus
+  Focus-FirefoxWindow $null | Out-Null
+  return $false
+}
+
+# 4) Build WPF UI
+Add-Type -AssemblyName PresentationCore,PresentationFramework,WindowsBase
+
+[xml]$xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Stock Ticker Opener"
+        Height="300" Width="660"
+        WindowStartupLocation="CenterScreen"
+        Background="#000000" ResizeMode="NoResize" WindowStyle="None">
+  <Grid>
+    <Grid.RowDefinitions>
+      <!-- Custom translucent neon title bar -->
+      <RowDefinition Height="36"/>
+      <RowDefinition/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+
+    <!-- Title Bar -->
+    <Border Grid.Row="0">
+      <Border.Background>
+        <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+          <GradientStop Color="#6600FF66" Offset="0"/>
+          <GradientStop Color="#2200FF66" Offset="1"/>
+        </LinearGradientBrush>
+      </Border.Background>
+      <Border.Effect>
+        <DropShadowEffect BlurRadius="18" ShadowDepth="0" Color="#00FF66" Opacity="0.55"/>
+      </Border.Effect>
+      <Grid x:Name="TitleBar" Height="36">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition/>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+        <TextBlock Text="Stock Ticker Opener" VerticalAlignment="Center" Margin="12,0,0,0"
+                   Foreground="#E0FFE8" FontFamily="Consolas" FontSize="14"/>
+        <Button x:Name="MinBtn" Grid.Column="1" Content="-" Width="40" Height="26" Margin="0,5,6,5"
+                Background="#0B1E14" Foreground="#8CFFBE" BorderBrush="#174A2F" Cursor="Hand">
+          <Button.Style>
+            <Style TargetType="Button">
+              <Setter Property="Template">
+                <Setter.Value>
+                  <ControlTemplate TargetType="Button">
+                    <Border CornerRadius="6" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1">
+                      <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Border>
+                  </ControlTemplate>
+                </Setter.Value>
+              </Setter>
+              <Setter Property="Opacity" Value="0.92"/>
+              <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                  <Setter Property="Background" Value="#0E2A1B"/>
+                  <Setter Property="Opacity" Value="1"/>
+                </Trigger>
+                <Trigger Property="IsPressed" Value="True">
+                  <Setter Property="Background" Value="#10412A"/>
+                </Trigger>
+              </Style.Triggers>
+            </Style>
+          </Button.Style>
+        </Button>
+        <Button x:Name="CloseBtn" Grid.Column="2" Content="x" Width="40" Height="26" Margin="0,5,8,5"
+                Background="#1E0B0B" Foreground="#FF7F7F" BorderBrush="#4A1717" Cursor="Hand">
+          <Button.Style>
+            <Style TargetType="Button">
+              <Setter Property="Template">
+                <Setter.Value>
+                  <ControlTemplate TargetType="Button">
+                    <Border CornerRadius="6" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1">
+                      <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Border>
+                  </ControlTemplate>
+                </Setter.Value>
+              </Setter>
+              <Setter Property="Opacity" Value="0.92"/>
+              <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                  <Setter Property="Background" Value="#2A0E0E"/>
+                  <Setter Property="Opacity" Value="1"/>
+                </Trigger>
+                <Trigger Property="IsPressed" Value="True">
+                  <Setter Property="Background" Value="#411010"/>
+                </Trigger>
+              </Style.Triggers>
+            </Style>
+          </Button.Style>
+        </Button>
+      </Grid>
+    </Border>
+
+    <Border Grid.Row="1" Margin="18" CornerRadius="16"
+            Background="#0B0B0B" BorderBrush="#123D2A" BorderThickness="1.5">
+      <Border.Effect>
+        <DropShadowEffect BlurRadius="24" ShadowDepth="0" Color="#00FF66" Opacity="0.28"/>
+      </Border.Effect>
+
+      <Grid Margin="18">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="12"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="16"/>
+          <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0" Text="STOCK TICKER OPENER" HorizontalAlignment="Center"
+                   Foreground="#9CFFC8" FontFamily="Consolas"
+                   FontSize="33" FontWeight="Bold">
+          <TextBlock.Effect>
+            <DropShadowEffect BlurRadius="20" ShadowDepth="0" Color="#00FF66" Opacity="0.35"/>
+          </TextBlock.Effect>
+        </TextBlock>
+
+        <TextBlock Grid.Row="2" HorizontalAlignment="Center" TextAlignment="Center"
+                   Text="Type a ticker to research..."
+                   Foreground="#7FFFC0" FontFamily="Consolas" FontSize="13"
+                   Opacity="0.9" TextWrapping="Wrap" />
+
+        <!-- Input Row -->
+        <Grid Grid.Row="4">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition/>
+            <ColumnDefinition Width="Auto"/>
+          </Grid.ColumnDefinitions>
+
+          <TextBlock Grid.Column="0" Text="> "
+                     Foreground="#00FF66" FontFamily="Consolas" FontSize="18"
+                     VerticalAlignment="Center"/>
+
+                    <Grid Grid.Column="1" VerticalAlignment="Center">
+            <TextBox x:Name="TickerBox"
+                     Background="#070707" BorderBrush="#0F3A1F" BorderThickness="1.6"
+                     Padding="6,2,6,2" Margin="0,0,10,0" Width="118"
+                     Foreground="#9CFFC8" CaretBrush="Transparent"
+                     FontFamily="Consolas" FontSize="30"
+                     MaxLength="6"
+                     ToolTip="Enter ticker and press Enter."
+                     HorizontalContentAlignment="Left"
+                     VerticalContentAlignment="Center">
+              <TextBox.Style>
+                <Style TargetType="TextBox">
+                  <Setter Property="Effect">
+                    <Setter.Value>
+                      <DropShadowEffect BlurRadius="10" ShadowDepth="0" Color="#00FF66" Opacity="0.2"/>
+                    </Setter.Value>
+                  </Setter>
+                  <Style.Triggers>
+                    <Trigger Property="IsKeyboardFocusWithin" Value="True">
+                      <Setter Property="BorderBrush" Value="#1EDC86"/>
+                      <Setter Property="Effect">
+                        <Setter.Value>
+                          <DropShadowEffect BlurRadius="16" ShadowDepth="0" Color="#00FF66" Opacity="0.45"/>
+                        </Setter.Value>
+                      </Setter>
+                    </Trigger>
+                  </Style.Triggers>
+                </Style>
+              </TextBox.Style>
+            </TextBox>
+            <!-- Overlay blinking block caret aligned to real caret -->
+            <Canvas x:Name="CaretCanvas" IsHitTestVisible="False" HorizontalAlignment="Stretch" VerticalAlignment="Stretch">
+              <Rectangle x:Name="BlockCaret" Width="8" Height="22" Fill="#00FF66" Opacity="0.0">
+                <Rectangle.Triggers>
+                  <EventTrigger RoutedEvent="Rectangle.Loaded">
+                    <BeginStoryboard>
+                      <Storyboard RepeatBehavior="Forever" AutoReverse="True">
+                        <DoubleAnimation Storyboard.TargetProperty="Opacity"
+                                         From="0.0" To="1.0" Duration="0:0:0.5"/>
+                      </Storyboard>
+                    </BeginStoryboard>
+                  </EventTrigger>
+                </Rectangle.Triggers>
+                <Rectangle.Effect>
+                  <DropShadowEffect BlurRadius="6" ShadowDepth="0" Color="#00FF66" Opacity="0.6"/>
+                </Rectangle.Effect>
+              </Rectangle>
+            </Canvas>
+          </Grid>
+
+          <Button Grid.Column="2" x:Name="OpenBtn" Content="Open"
+                  Background="#0B1E14" Foreground="#8CFFBE"
+                  BorderBrush="#174A2F" FontFamily="Consolas"
+                  Padding="12,7" Margin="6,0,0,0"
+                  HorizontalAlignment="Right" Cursor="Hand">
+            <Button.Style>
+              <Style TargetType="Button">
+                <Setter Property="Template">
+                  <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                      <Border CornerRadius="8" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1.2">
+                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                      </Border>
+                    </ControlTemplate>
+                  </Setter.Value>
+                </Setter>
+                <Setter Property="Effect">
+                  <Setter.Value>
+                    <DropShadowEffect BlurRadius="14" ShadowDepth="0" Color="#00FF66" Opacity="0.28"/>
+                  </Setter.Value>
+                </Setter>
+                <Style.Triggers>
+                  <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="#0E2A1B"/>
+                  </Trigger>
+                  <Trigger Property="IsPressed" Value="True">
+                    <Setter Property="Background" Value="#10412A"/>
+                  </Trigger>
+                </Style.Triggers>
+              </Style>
+            </Button.Style>
+          </Button>
+        </Grid>
+      </Grid>
+    </Border>
+
+    <!-- Footer -->
+    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,6,0,12">
+      <TextBlock Foreground="#66FFC4" FontFamily="Consolas" FontSize="12"
+                 Text="Enter = open - Esc = clear - Close window to quit"/>
+    </StackPanel>
+    
+    <!-- Digital Rain overlay spanning entire window -->
+    <Canvas x:Name="DigitalRain" Grid.RowSpan="3" IsHitTestVisible="False"
+            Opacity="0.18" Panel.ZIndex="9"/>  </Grid>
+</Window>
+"@
+
+# Load XAML into WPF
+$reader = New-Object System.Xml.XmlNodeReader $xaml
+$window = [Windows.Markup.XamlReader]::Load($reader)
+
+try { Ensure-StockOpenerInstance } catch { Write-Warning $_ }
+
+   
+$TitleBar    = $window.FindName('TitleBar')
+$MinBtn      = $window.FindName('MinBtn')
+$CloseBtn    = $window.FindName('CloseBtn')
+$TickerBox   = $window.FindName('TickerBox')
+$OpenBtn     = $window.FindName('OpenBtn')
+$CaretCanvas = $window.FindName('CaretCanvas')
+$BlockCaret  = $window.FindName('BlockCaret')
+$DigitalRain = $window.FindName('DigitalRain')
+# Block caret overlay support
+function Update-BlockCaret {
+  try {
+    $rect = $TickerBox.GetRectFromCharacterIndex($TickerBox.CaretIndex, $true)
+    if ($rect -ne $null -and $CaretCanvas) {
+      $pt   = $TickerBox.TranslatePoint([System.Windows.Point]::new([double]$rect.X, [double]$rect.Y), $CaretCanvas)
+      [System.Windows.Controls.Canvas]::SetLeft($BlockCaret, [double]$pt.X)
+      [System.Windows.Controls.Canvas]::SetTop($BlockCaret,  [double]$pt.Y)
+      $BlockCaret.Height = [double]$rect.Height
+    }
+  } catch {}
+}
+$TickerBox.Add_TextChanged({ Update-BlockCaret })
+$TickerBox.Add_SelectionChanged({ Update-BlockCaret })
+$TickerBox.Add_SizeChanged({ Update-BlockCaret })
+$window.Add_ContentRendered({ Update-BlockCaret })
+# Focus the input when the window shows
+$window.Add_SourceInitialized({ $TickerBox.Focus() })
+
+# Custom title bar behavior: drag, minimize, close
+if ($TitleBar) {
+  $TitleBar.Add_MouseLeftButtonDown({ param($s,$e) try { $window.DragMove() } catch {} })
+}
+if ($MinBtn)   { $MinBtn.Add_Click({ $window.WindowState = 'Minimized' }) }
+if ($CloseBtn) { $CloseBtn.Add_Click({ $window.Close() }) }
+
+# Uppercase & strip spaces live
+$TickerBox.Add_TextChanged({
+  $TickerBox.Text = ($TickerBox.Text -replace '\s','').ToUpper()
+  $TickerBox.CaretIndex = $TickerBox.Text.Length
+})
+
+# Watch Firefox windows: when one closes, refocus the next window below
+$script:LastFxCount = (Get-FirefoxWindows).Count
+$WindowWatchTimer = New-Object System.Windows.Threading.DispatcherTimer
+$WindowWatchTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+$WindowWatchTimer.Add_Tick({
+  try {
+    $current = (Get-FirefoxWindows).Count
+    if ($script:LastFxCount -gt $current -and $current -gt 0) {
+      # A Firefox window closed; bring the next one to foreground
+      Focus-TopFirefoxWindow | Out-Null
+    }
+    $script:LastFxCount = $current
+  } catch {}
+})
+$WindowWatchTimer.Start()
+
+# ========== Digital Rain ==========
+$script:RainTimer   = $null
+$script:RainStreams = @()
+
+function New-RandomChar {
+  $chars = '01ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+  return $chars[(Get-Random -Minimum 0 -Maximum $chars.Length)]
+}
+
+function New-StreamText([int]$length) {
+  $sb = New-Object System.Text.StringBuilder
+  for ($i=0; $i -lt $length; $i++) {
+    [void]$sb.Append((New-RandomChar))
+    if ($i -lt $length-1) { [void]$sb.Append("`n") }
+  }
+  return $sb.ToString()
+}
+
+function Init-DigitalRain {
+  if (-not $DigitalRain) { return }
+  $DigitalRain.Children.Clear()
+  $script:RainStreams = @()
+
+  $w = [double]$window.ActualWidth
+  $h = [double]$window.ActualHeight
+  if ($w -le 0 -or $h -le 0) { return }
+
+  $colWidth  = 22.0   # px between streams
+  $fontSize  = 16.0
+  $lineH     = 18.0
+  $cols = [int][Math]::Ceiling($w / $colWidth)
+
+  for ($i=0; $i -lt $cols; $i++) {
+    $len   = Get-Random -Minimum 6 -Maximum 18
+    $tb    = New-Object System.Windows.Controls.TextBlock
+    $tb.FontFamily = 'Consolas'
+    $tb.FontSize   = $fontSize
+    $tb.Foreground = (New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.ColorConverter]
