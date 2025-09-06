@@ -274,7 +274,7 @@ Add-Type -AssemblyName PresentationCore,PresentationFramework,WindowsBase
             <TextBox x:Name="TickerBox"
                      Background="#070707" BorderBrush="#0F3A1F" BorderThickness="1.6"
                      Padding="12,7,12,7" Margin="0,0,10,0"
-                     Foreground="#9CFFC8" CaretBrush="#00FF66"
+                     Foreground="#9CFFC8" CaretBrush="Transparent"
                      FontFamily="Consolas" FontSize="18"
                      MaxLength="10"
                      ToolTip="Enter ticker and press Enter."
