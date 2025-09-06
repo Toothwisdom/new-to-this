@@ -1,0 +1,344 @@
+# StockOpenerGUI.ps1 - Neon terminal GUI; persistent Firefox profile
+# Each ticker: open Yahoo + Zacks + Finviz together in a new window (Yahoo focused)
+# Uses the same 'StockOpener' Firefox profile every time; welcome suppressed
+
+$ErrorActionPreference = 'Stop'
+
+function Get-FirefoxPath {
+  $candidates = @(
+    "$env:ProgramFiles\Mozilla Firefox\firefox.exe",
+    "$env:ProgramFiles(x86)\Mozilla Firefox\firefox.exe"
+  )
+  foreach ($p in $candidates) { if (Test-Path $p) { return $p } }
+  throw "Firefox not found. Edit Get-FirefoxPath() to point to firefox.exe."
+}
+
+# 1) Locate Firefox
+$Firefox = Get-FirefoxPath
+
+# 2) Ensure StockOpener profile (fixed path so prefs persist)
+$ProfileDir = Join-Path $env:APPDATA 'Mozilla\Firefox\Profiles\StockOpener'
+if (-not (Test-Path $ProfileDir)) { New-Item -ItemType Directory -Path $ProfileDir -Force | Out-Null }
+& $Firefox -CreateProfile "StockOpener $ProfileDir" | Out-Null
+
+# 3) Enforce prefs: tab behavior + suppress welcome/first-run
+$userJs = @"
+user_pref("browser.link.open_newwindow", 3);
+user_pref("browser.link.open_newwindow.restriction", 0);
+// Keep additional tabs in background so Yahoo stays focused
+user_pref("browser.tabs.loadInBackground", true);
+user_pref("browser.tabs.loadDivertedInBackground", true);
+// Append tabs at the end to preserve Yahoo, Zacks, Finviz order
+user_pref("browser.tabs.insertRelatedAfterCurrent", false);
+user_pref("browser.tabs.insertAfterCurrent", false);
+// Tame first-run noise
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("browser.sessionstore.resume_from_crash", false);
+// Suppress about:welcome and any first-run homepage overrides
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("trailhead.firstrun.didSeeAboutWelcome", true);
+user_pref("startup.homepage_welcome_url", "");
+user_pref("startup.homepage_welcome_url.additional", "");
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("browser.startup.homepage", "about:blank");
+user_pref("browser.startup.page", 1);
+// Trust Windows cert store (prevents TLS issues with AV/proxies)
+user_pref("security.enterprise_roots.enabled", true);
+"@
+Set-Content -Encoding ASCII -Path (Join-Path $ProfileDir 'user.js') -Value $userJs
+
+# 3.5) Ensure no other Firefox is running (we will start on first ticker)
+function Ensure-StockOpenerInstance {
+  while (Get-Process -Name firefox -ErrorAction SilentlyContinue) {
+    $res = [System.Windows.MessageBox]::Show(
+      "Please close ALL Firefox windows, then click OK to continue.",
+      "Firefox is running",
+      'OKCancel',
+      'Warning'
+    )
+    if ($res -eq 'Cancel') { throw 'Canceled due to running Firefox processes.' }
+  }
+}
+
+# Bring the just-opened Firefox window to the foreground
+function Focus-FirefoxWindow([string]$Ticker) {
+  try {
+    $shell = New-Object -ComObject WScript.Shell
+    for ($i = 0; $i -lt 15; $i++) {
+      # Prefer matching the Yahoo title which starts with the ticker (e.g., "AAPL - ... - Yahoo Finance")
+      if ($Ticker) {
+        if ($shell.AppActivate($Ticker)) { return }
+      }
+      # Generic Firefox window title match
+      if ($shell.AppActivate('Mozilla Firefox')) { return }
+      if ($shell.AppActivate('Yahoo Finance')) { return }
+
+      # Fallback: activate the main Firefox window by PID
+      $proc = Get-Process -Name firefox -ErrorAction SilentlyContinue |
+              Where-Object { $_.MainWindowHandle -ne 0 } |
+              Select-Object -First 1
+      if ($proc) {
+        if ($shell.AppActivate([int]$proc.Id)) { return }
+      }
+      Start-Sleep -Milliseconds 150
+    }
+  } catch {}
+}
+
+# Win32 helpers to enumerate top-level windows and bring top Firefox window to front
+if (-not ('Win32.NativeMethods' -as [type])) {
+  Add-Type -Language CSharp -TypeDefinition @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+
+namespace Win32 {
+  public static class NativeMethods {
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder sb, int maxCount);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder sb, int maxCount);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  }
+}
+"@
+}
+
+function Get-FirefoxWindows {
+  $handles = New-Object System.Collections.Generic.List[System.IntPtr]
+  $cb = [Win32.NativeMethods+EnumWindowsProc]{ param([IntPtr]$h,[IntPtr]$p)
+    if ([Win32.NativeMethods]::IsWindowVisible($h)) {
+      $cls = New-Object System.Text.StringBuilder 256
+      [void][Win32.NativeMethods]::GetClassName($h, $cls, $cls.Capacity)
+      if ($cls.ToString() -eq 'MozillaWindowClass') { $handles.Add($h) }
+    }
+    return $true
+  }
+  [void][Win32.NativeMethods]::EnumWindows($cb, [IntPtr]::Zero)
+  return $handles
+}
+
+function Focus-TopFirefoxWindow {
+  try {
+    $wins = Get-FirefoxWindows
+    if ($wins.Count -gt 0) {
+      $h = $wins[0]
+      # Restore if minimized (SW_RESTORE = 9)
+      if ([Win32.NativeMethods]::IsIconic($h)) { [void][Win32.NativeMethods]::ShowWindow($h, 9) }
+      [void][Win32.NativeMethods]::SetForegroundWindow($h)
+      return $true
+    }
+  } catch {}
+  # Fallback to COM-based focus
+  Focus-FirefoxWindow $null | Out-Null
+  return $false
+}
+
+# 4) Build WPF UI
+Add-Type -AssemblyName PresentationCore,PresentationFramework,WindowsBase
+
+[xml]$xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Stock Ticker Opener"
+        Height="280" Width="620"
+        WindowStartupLocation="CenterScreen"
+        Background="#000000" ResizeMode="NoResize">
+  <Grid>
+    <Grid.RowDefinitions>
+      <RowDefinition/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+
+    <Border Grid.Row="0" Margin="18" CornerRadius="16"
+            Background="#0A0A0A" BorderBrush="#103311" BorderThickness="2">
+      <Border.Effect>
+        <DropShadowEffect BlurRadius="25" ShadowDepth="0" Color="#00FF66" Opacity="0.35"/>
+      </Border.Effect>
+
+      <Grid Margin="18">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="12"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="16"/>
+          <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0" Text="STOCK TICKER OPENER"
+                   Foreground="#00FF7F" FontFamily="Consolas"
+                   FontSize="22" FontWeight="Bold" />
+
+        <TextBlock Grid.Row="2"
+                   Text="Type a ticker and press Enter. Yahoo opens focused; Zacks and Finviz open in background tabs."
+                   Foreground="#66FFB3" FontFamily="Consolas" FontSize="13"
+                   Opacity="0.9" TextWrapping="Wrap" />
+
+        <!-- Input Row -->
+        <Grid Grid.Row="4">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition/>
+            <ColumnDefinition Width="Auto"/>
+          </Grid.ColumnDefinitions>
+
+          <TextBlock Grid.Column="0" Text="> "
+                     Foreground="#00FF66" FontFamily="Consolas" FontSize="18"
+                     VerticalAlignment="Center"/>
+
+                    <Grid Grid.Column="1" VerticalAlignment="Center">
+            <TextBox x:Name="TickerBox"
+                     Background="#000000" BorderBrush="#0F3A1F" BorderThickness="1.5"
+                     Padding="10,6,10,6" Margin="0,0,10,0"
+                     Foreground="#00FF66" CaretBrush="Transparent"
+                     FontFamily="Consolas" FontSize="18"
+                     MaxLength="10"
+                     ToolTip="Enter ticker and press Enter."
+                     HorizontalContentAlignment="Left"
+                     VerticalContentAlignment="Center">
+              <TextBox.Effect>
+                <DropShadowEffect BlurRadius="12" ShadowDepth="0" Color="#00FF66" Opacity="0.25"/>
+              </TextBox.Effect>
+            </TextBox>
+            <!-- Overlay blinking block caret aligned to real caret -->
+            <Canvas x:Name="CaretCanvas" IsHitTestVisible="False" HorizontalAlignment="Stretch" VerticalAlignment="Stretch">
+              <Rectangle x:Name="BlockCaret" Width="8" Height="22" Fill="#00FF66" Opacity="0.0">
+                <Rectangle.Triggers>
+                  <EventTrigger RoutedEvent="Rectangle.Loaded">
+                    <BeginStoryboard>
+                      <Storyboard RepeatBehavior="Forever" AutoReverse="True">
+                        <DoubleAnimation Storyboard.TargetProperty="Opacity"
+                                         From="0.0" To="1.0" Duration="0:0:0.5"/>
+                      </Storyboard>
+                    </BeginStoryboard>
+                  </EventTrigger>
+                </Rectangle.Triggers>
+                <Rectangle.Effect>
+                  <DropShadowEffect BlurRadius="6" ShadowDepth="0" Color="#00FF66" Opacity="0.6"/>
+                </Rectangle.Effect>
+              </Rectangle>
+            </Canvas>
+          </Grid>
+
+          <Button Grid.Column="2" x:Name="OpenBtn" Content="Open"
+                  Background="#071E12" Foreground="#00FF7F"
+                  BorderBrush="#0F3A1F" FontFamily="Consolas"
+                  Padding="10,6" Margin="6,0,0,0"
+                  HorizontalAlignment="Right" Cursor="Hand">
+            <Button.Effect>
+              <DropShadowEffect BlurRadius="10" ShadowDepth="0" Color="#00FF66" Opacity="0.25"/>
+            </Button.Effect>
+          </Button>
+        </Grid>
+      </Grid>
+    </Border>
+
+    <!-- Footer -->
+    <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,6,0,12">
+      <TextBlock Foreground="#33FF99" FontFamily="Consolas" FontSize="12"
+                 Text="Enter = open - Esc = clear - Close window to quit"/>
+    </StackPanel>
+  </Grid>
+</Window>
+"@
+
+# Load XAML into WPF
+$reader = New-Object System.Xml.XmlNodeReader $xaml
+$window = [Windows.Markup.XamlReader]::Load($reader)
+
+try { Ensure-StockOpenerInstance } catch { Write-Warning $_ }
+
+   
+$TickerBox = $window.FindName('TickerBox')
+$OpenBtn   = $window.FindName('OpenBtn')
+$BlockCaret = $window.FindName('BlockCaret')
+# Block caret overlay support
+function Update-BlockCaret {
+  try {
+    $rect = $TickerBox.GetRectFromCharacterIndex($TickerBox.CaretIndex, $true)
+    if ($rect -ne $null) {
+      [System.Windows.Controls.Canvas]::SetLeft($BlockCaret, [double]$rect.X)
+      [System.Windows.Controls.Canvas]::SetTop($BlockCaret, [double]$rect.Y)
+      $BlockCaret.Height = [double]$rect.Height
+    }
+  } catch {}
+}
+$TickerBox.Add_TextChanged({ Update-BlockCaret })
+$TickerBox.Add_SelectionChanged({ Update-BlockCaret })
+$TickerBox.Add_SizeChanged({ Update-BlockCaret })
+$window.Add_ContentRendered({ Update-BlockCaret })
+# Focus the input when the window shows
+$window.Add_SourceInitialized({ $TickerBox.Focus() })
+
+# Uppercase & strip spaces live
+$TickerBox.Add_TextChanged({
+  $TickerBox.Text = ($TickerBox.Text -replace '\s','').ToUpper()
+  $TickerBox.CaretIndex = $TickerBox.Text.Length
+})
+
+# Watch Firefox windows: when one closes, refocus the next window below
+$script:LastFxCount = (Get-FirefoxWindows).Count
+$WindowWatchTimer = New-Object System.Windows.Threading.DispatcherTimer
+$WindowWatchTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+$WindowWatchTimer.Add_Tick({
+  try {
+    $current = (Get-FirefoxWindows).Count
+    if ($script:LastFxCount -gt $current -and $current -gt 0) {
+      # A Firefox window closed; bring the next one to foreground
+      Focus-TopFirefoxWindow | Out-Null
+    }
+    $script:LastFxCount = $current
+  } catch {}
+})
+$WindowWatchTimer.Start()
+
+function Open-Tabs([string]$Ticker) {
+  if ($Ticker -notmatch '^[A-Z0-9]{1,10}$') {
+    [System.Windows.MessageBox]::Show("Use 1-10 letters/numbers.","Invalid Ticker",'OK','Warning') | Out-Null
+    return
+  }
+
+  # Always open a new window, then add background tabs to that window
+  $y = ("https://finance.yahoo.com/quote/{0}" -f $Ticker)
+  $z = ("https://www.zacks.com/stock/quote/{0}" -f $Ticker)
+  $f = ("https://finviz.com/quote.ashx?t={0}" -f $Ticker)
+
+  # Create the new window first (Yahoo focused)
+  & $Firefox -P StockOpener -new-window $y
+  Start-Sleep -Milliseconds 600
+
+  # Then add the two tabs; they should land in the active (new) window
+  & $Firefox -P StockOpener -new-tab $z
+  Start-Sleep -Milliseconds 200
+  & $Firefox -P StockOpener -new-tab $f
+
+  # Finally bring that window to the foreground
+  Start-Sleep -Milliseconds 250
+  Focus-FirefoxWindow $Ticker
+}
+
+# Enter opens; Esc clears
+$TickerBox.Add_PreviewKeyDown({
+  param($s,$e)
+  if ($e.Key -eq 'Return' -or $e.Key -eq 'Enter') {
+    $t = $TickerBox.Text.Trim()
+    if ($t) { Open-Tabs $t; $TickerBox.Clear() }
+    $e.Handled = $true
+  } elseif ($e.Key -eq 'Escape') {
+    $TickerBox.Clear()
+    $e.Handled = $true
+  }
+})
+
+# Button click does the same as Enter
+$OpenBtn.Add_Click({
+  $t = $TickerBox.Text.Trim()
+  if ($t) { Open-Tabs $t; $TickerBox.Clear() }
+})
+
+# Show the window (modal)
+$null = $window.ShowDialog()
