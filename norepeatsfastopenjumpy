@@ -1,0 +1,908 @@
+# StockOpenerGUI.ps1 - Neon terminal GUI; persistent Firefox profile
+# Each ticker: open Yahoo + Zacks + Finviz together in a new window (Yahoo focused)
+# Uses the same 'StockOpener' Firefox profile every time; welcome suppressed
+
+$ErrorActionPreference = 'Stop'
+
+# Performance defaults for the digital rain UI
+if ($null -eq $script:MaxRainStreams) { $script:MaxRainStreams = 24 }
+if ($null -eq $script:PrefillVisible) { $script:PrefillVisible = $true }
+# Allow streams to extend past left/right edges by this many pixels (global overscan)
+if ($null -eq $script:HorizOverscan) { $script:HorizOverscan = 48 }
+# Extra right/left-only column(s) and additional beyond-overscan shift
+if ($null -eq $script:ExtraRightColumns) { $script:ExtraRightColumns = 1 }
+if ($null -eq $script:RightEdgeExtra)   { $script:RightEdgeExtra   = 96 }
+if ($null -eq $script:ExtraLeftColumns)  { $script:ExtraLeftColumns  = 1 }
+if ($null -eq $script:LeftEdgeExtra)     { $script:LeftEdgeExtra     = 96 }
+if ($null -eq $script:DeferTickerLoad)   { $script:DeferTickerLoad   = $true }
+
+function Get-FirefoxPath {
+  $candidates = @(
+    "$env:ProgramFiles\Mozilla Firefox\firefox.exe",
+    "$env:ProgramFiles(x86)\Mozilla Firefox\firefox.exe"
+  )
+  foreach ($p in $candidates) { if (Test-Path $p) { return $p } }
+  throw "Firefox not found. Edit Get-FirefoxPath() to point to firefox.exe."
+}
+
+# 1) Locate Firefox
+$Firefox = Get-FirefoxPath
+
+# 2) Ensure StockOpener profile (fixed path so prefs persist)
+$ProfileDir = Join-Path $env:APPDATA 'Mozilla\Firefox\Profiles\StockOpener'
+if (-not (Test-Path $ProfileDir)) { New-Item -ItemType Directory -Path $ProfileDir -Force | Out-Null }
+# Create profile only if not already registered in profiles.ini (faster startup)
+$profilesIni = Join-Path $env:APPDATA 'Mozilla\Firefox\profiles.ini'
+$hasStockProfile = $false
+try {
+  if (Test-Path $profilesIni) {
+    $hasStockProfile = Select-String -Path $profilesIni -SimpleMatch -Pattern 'Name=StockOpener' -Quiet
+  }
+} catch {}
+if (-not $hasStockProfile) {
+  & $Firefox -CreateProfile "StockOpener $ProfileDir" | Out-Null
+}
+
+# 3) Enforce prefs: tab behavior + suppress welcome/first-run
+$userJs = @"
+user_pref("browser.link.open_newwindow", 3);
+user_pref("browser.link.open_newwindow.restriction", 0);
+// Keep additional tabs in background so Yahoo stays focused
+user_pref("browser.tabs.loadInBackground", true);
+user_pref("browser.tabs.loadDivertedInBackground", true);
+// Append tabs at the end to preserve Yahoo, Zacks, Finviz order
+user_pref("browser.tabs.insertRelatedAfterCurrent", false);
+user_pref("browser.tabs.insertAfterCurrent", false);
+// Tame first-run noise
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("browser.sessionstore.resume_from_crash", false);
+// Suppress about:welcome and any first-run homepage overrides
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("trailhead.firstrun.didSeeAboutWelcome", true);
+user_pref("startup.homepage_welcome_url", "");
+user_pref("startup.homepage_welcome_url.additional", "");
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("browser.startup.homepage", "about:blank");
+user_pref("browser.startup.page", 1);
+// Trust Windows cert store (prevents TLS issues with AV/proxies)
+user_pref("security.enterprise_roots.enabled", true);
+"@
+# Write prefs only when changed to avoid unnecessary disk I/O
+$userJsPath = Join-Path $ProfileDir 'user.js'
+try {
+  $existing = if (Test-Path $userJsPath) { Get-Content -Raw -LiteralPath $userJsPath -ErrorAction SilentlyContinue } else { $null }
+  if ($existing -ne $userJs) {
+    Set-Content -Encoding ASCII -Path $userJsPath -Value $userJs
+  }
+} catch {
+  # Best-effort; ignore if unable to write
+}
+
+# 3.5) Ensure no other Firefox is running (we will start on first ticker)
+function Ensure-StockOpenerInstance {
+  while (Get-Process -Name firefox -ErrorAction SilentlyContinue) {
+    $res = [System.Windows.MessageBox]::Show(
+      "Please close ALL Firefox windows, then click OK to continue.",
+      "Firefox is running",
+      'OKCancel',
+      'Warning'
+    )
+    if ($res -eq 'Cancel') { throw 'Canceled due to running Firefox processes.' }
+  }
+}
+
+# Bring the just-opened Firefox window to the foreground
+function Focus-FirefoxWindow([string]$Ticker) {
+  try {
+    $shell = New-Object -ComObject WScript.Shell
+    for ($i = 0; $i -lt 15; $i++) {
+      # Prefer matching the Yahoo title which starts with the ticker (e.g., "AAPL - ... - Yahoo Finance")
+      if ($Ticker) {
+        if ($shell.AppActivate($Ticker)) { return }
+      }
+      # Generic Firefox window title match
+      if ($shell.AppActivate('Mozilla Firefox')) { return }
+      if ($shell.AppActivate('Yahoo Finance')) { return }
+
+      # Fallback: activate the main Firefox window by PID
+      $proc = Get-Process -Name firefox -ErrorAction SilentlyContinue |
+              Where-Object { $_.MainWindowHandle -ne 0 } |
+              Select-Object -First 1
+      if ($proc) {
+        if ($shell.AppActivate([int]$proc.Id)) { return }
+      }
+      Start-Sleep -Milliseconds 150
+    }
+  } catch {}
+}
+
+# Win32 helpers to enumerate top-level windows and bring top Firefox window to front
+function Ensure-Win32Helpers {
+  if (-not ('Win32.NativeMethods' -as [type])) {
+    Add-Type -Language CSharp -TypeDefinition @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+
+namespace Win32 {
+  public static class NativeMethods {
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder sb, int maxCount);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder sb, int maxCount);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  }
+}
+"@
+  }
+}
+
+function Get-FirefoxWindows {
+  Ensure-Win32Helpers
+  $handles = New-Object System.Collections.Generic.List[System.IntPtr]
+  $cb = [Win32.NativeMethods+EnumWindowsProc]{ param([IntPtr]$h,[IntPtr]$p)
+    if ([Win32.NativeMethods]::IsWindowVisible($h)) {
+      $cls = New-Object System.Text.StringBuilder 256
+      [void][Win32.NativeMethods]::GetClassName($h, $cls, $cls.Capacity)
+      if ($cls.ToString() -eq 'MozillaWindowClass') { $handles.Add($h) }
+    }
+    return $true
+  }
+  [void][Win32.NativeMethods]::EnumWindows($cb, [IntPtr]::Zero)
+  return $handles
+}
+
+function Focus-TopFirefoxWindow {
+  try {
+    Ensure-Win32Helpers
+    $wins = Get-FirefoxWindows
+    if ($wins.Count -gt 0) {
+      $h = $wins[0]
+      # Restore if minimized (SW_RESTORE = 9)
+      if ([Win32.NativeMethods]::IsIconic($h)) { [void][Win32.NativeMethods]::ShowWindow($h, 9) }
+      [void][Win32.NativeMethods]::SetForegroundWindow($h)
+      return $true
+    }
+  } catch {}
+  # Fallback to COM-based focus
+  Focus-FirefoxWindow $null | Out-Null
+  return $false
+}
+
+# 4) Build WPF UI
+Add-Type -AssemblyName PresentationCore,PresentationFramework,WindowsBase
+
+# Cached/frozen brushes to reduce allocations during animation
+if (-not $script:BrushDim)    { $script:BrushDim    = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.ColorConverter]::ConvertFromString('#3300FF66')); if ($script:BrushDim.CanFreeze)    { $script:BrushDim.Freeze() } }
+if (-not $script:BrushBright) { $script:BrushBright = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.ColorConverter]::ConvertFromString('#FF00FF66')); if ($script:BrushBright.CanFreeze) { $script:BrushBright.Freeze() } }
+
+[xml]$xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Stock Ticker Opener"
+        Height="300" Width="660"
+        WindowStartupLocation="CenterScreen"
+        Background="#000000" ResizeMode="NoResize" WindowStyle="None">
+  <Grid>
+    <Grid.RowDefinitions>
+      <!-- Custom translucent neon title bar -->
+      <RowDefinition Height="36"/>
+      <RowDefinition/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+
+    <!-- Title Bar -->
+    <Border Grid.Row="0">
+      <Border.Background>
+        <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+          <GradientStop Color="#6600FF66" Offset="0"/>
+          <GradientStop Color="#2200FF66" Offset="1"/>
+        </LinearGradientBrush>
+      </Border.Background>
+      
+      <Grid x:Name="TitleBar" Height="36">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition/>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+        <TextBlock Text="Stock Ticker Opener" VerticalAlignment="Center" Margin="12,0,0,0"
+                   Foreground="#E0FFE8" FontFamily="Consolas" FontSize="14"/>
+        <Button x:Name="MinBtn" Grid.Column="1" Content="-" Width="40" Height="26" Margin="0,5,6,5"
+                Background="#0B1E14" Foreground="#8CFFBE" BorderBrush="#174A2F" Cursor="Hand">
+          <Button.Style>
+            <Style TargetType="Button">
+              <Setter Property="Template">
+                <Setter.Value>
+                  <ControlTemplate TargetType="Button">
+                    <Border CornerRadius="6" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1">
+                      <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Border>
+                  </ControlTemplate>
+                </Setter.Value>
+              </Setter>
+              <Setter Property="Opacity" Value="0.92"/>
+              <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                  <Setter Property="Background" Value="#0E2A1B"/>
+                  <Setter Property="Opacity" Value="1"/>
+                </Trigger>
+                <Trigger Property="IsPressed" Value="True">
+                  <Setter Property="Background" Value="#10412A"/>
+                </Trigger>
+              </Style.Triggers>
+            </Style>
+          </Button.Style>
+        </Button>
+        <Button x:Name="CloseBtn" Grid.Column="2" Content="x" Width="40" Height="26" Margin="0,5,8,5"
+                Background="#1E0B0B" Foreground="#FF7F7F" BorderBrush="#4A1717" Cursor="Hand">
+          <Button.Style>
+            <Style TargetType="Button">
+              <Setter Property="Template">
+                <Setter.Value>
+                  <ControlTemplate TargetType="Button">
+                    <Border CornerRadius="6" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1">
+                      <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Border>
+                  </ControlTemplate>
+                </Setter.Value>
+              </Setter>
+              <Setter Property="Opacity" Value="0.92"/>
+              <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                  <Setter Property="Background" Value="#2A0E0E"/>
+                  <Setter Property="Opacity" Value="1"/>
+                </Trigger>
+                <Trigger Property="IsPressed" Value="True">
+                  <Setter Property="Background" Value="#411010"/>
+                </Trigger>
+              </Style.Triggers>
+            </Style>
+          </Button.Style>
+        </Button>
+      </Grid>
+    </Border>
+
+    <Border Grid.Row="1" Margin="18" CornerRadius="16"
+            Background="#0B0B0B" BorderBrush="#123D2A" BorderThickness="1.5">
+      
+
+      <Grid Margin="18">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="12"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="16"/>
+          <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0" Text="STOCK TICKER OPENER" HorizontalAlignment="Center"
+                   Foreground="#9CFFC8" FontFamily="Consolas"
+                   FontSize="33" FontWeight="Bold">
+          
+        </TextBlock>
+
+        <TextBlock Grid.Row="2" HorizontalAlignment="Center" TextAlignment="Center"
+                   Text="Type a ticker to research..."
+                   Foreground="#7FFFC0" FontFamily="Consolas" FontSize="13"
+                   Opacity="0.9" TextWrapping="Wrap" />
+
+        <!-- Input Row -->
+        <Grid Grid.Row="4">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition/>
+            <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="Auto"/>
+          </Grid.ColumnDefinitions>
+
+          <TextBlock Grid.Column="0" Text="> "
+                     Foreground="#00FF66" FontFamily="Consolas" FontSize="18"
+                     VerticalAlignment="Center"/>
+
+                    <Grid Grid.Column="1" VerticalAlignment="Center">
+            <TextBox x:Name="TickerBox"
+                     Background="#070707" BorderBrush="#0F3A1F" BorderThickness="1.6"
+                     Padding="6,2,6,2" Margin="0,0,10,0" Width="118"
+                     Foreground="#9CFFC8" CaretBrush="Transparent"
+                     FontFamily="Consolas" FontSize="30"
+                     MaxLength="6"
+                     ToolTip="Enter ticker and press Enter."
+                     HorizontalContentAlignment="Left"
+                     VerticalContentAlignment="Center">
+              <TextBox.Style>
+                <Style TargetType="TextBox">
+                  
+                  <Style.Triggers>
+                    <Trigger Property="IsKeyboardFocusWithin" Value="True">
+                      <Setter Property="BorderBrush" Value="#1EDC86"/>
+                      
+                    </Trigger>
+                  </Style.Triggers>
+                </Style>
+              </TextBox.Style>
+            </TextBox>
+            <!-- Overlay blinking block caret aligned to real caret -->
+            <Canvas x:Name="CaretCanvas" IsHitTestVisible="False" HorizontalAlignment="Stretch" VerticalAlignment="Stretch">
+              <Rectangle x:Name="BlockCaret" Width="8" Height="22" Fill="#00FF66" Opacity="0.0">
+                <Rectangle.Triggers>
+                  <EventTrigger RoutedEvent="Rectangle.Loaded">
+                    <BeginStoryboard>
+                      <Storyboard RepeatBehavior="Forever" AutoReverse="True">
+                        <DoubleAnimation Storyboard.TargetProperty="Opacity"
+                                         From="0.0" To="1.0" Duration="0:0:0.5"/>
+                      </Storyboard>
+                    </BeginStoryboard>
+                  </EventTrigger>
+                </Rectangle.Triggers>
+                
+              </Rectangle>
+            </Canvas>
+          </Grid>
+
+          <Button Grid.Column="2" x:Name="OpenBtn" Content="Open"
+                  Background="#0B1E14" Foreground="#8CFFBE"
+                  BorderBrush="#174A2F" FontFamily="Consolas"
+                  Padding="12,7" Margin="6,0,0,0"
+                  HorizontalAlignment="Right" Cursor="Hand">
+            <Button.Style>
+              <Style TargetType="Button">
+                <Setter Property="Template">
+                  <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                      <Border CornerRadius="8" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1.2">
+                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                      </Border>
+                    </ControlTemplate>
+                  </Setter.Value>
+                </Setter>
+                
+                <Style.Triggers>
+                  <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="#0E2A1B"/>
+                  </Trigger>
+                  <Trigger Property="IsPressed" Value="True">
+                    <Setter Property="Background" Value="#10412A"/>
+                  </Trigger>
+                </Style.Triggers>
+              </Style>
+            </Button.Style>
+          </Button>
+
+          
+        </Grid>
+      </Grid>
+    </Border>
+
+    <!-- Footer -->
+    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,6,0,12">
+      <TextBlock Foreground="#66FFC4" FontFamily="Consolas" FontSize="12"
+                 Text="Enter = open - Esc = clear - Close window to quit"/>
+    </StackPanel>
+    
+    <!-- Digital Rain overlay spanning entire window -->
+    <Canvas x:Name="DigitalRain" Grid.RowSpan="3" IsHitTestVisible="False"
+            Opacity="0.7" Panel.ZIndex="9"/>  </Grid>
+</Window>
+"@
+
+# Load XAML into WPF
+$reader = New-Object System.Xml.XmlNodeReader $xaml
+$window = [Windows.Markup.XamlReader]::Load($reader)
+
+# (Startup non-blocking) We will prompt to close Firefox only when opening a ticker
+
+   
+$TitleBar    = $window.FindName('TitleBar')
+$MinBtn      = $window.FindName('MinBtn')
+$CloseBtn    = $window.FindName('CloseBtn')
+$TickerBox   = $window.FindName('TickerBox')
+$OpenBtn     = $window.FindName('OpenBtn')
+$CaretCanvas = $window.FindName('CaretCanvas')
+$BlockCaret  = $window.FindName('BlockCaret')
+$DigitalRain = $window.FindName('DigitalRain')
+# Block caret overlay support
+function Update-BlockCaret {
+  try {
+    $rect = $TickerBox.GetRectFromCharacterIndex($TickerBox.CaretIndex, $true)
+    if ($rect -ne $null -and $CaretCanvas) {
+      $pt   = $TickerBox.TranslatePoint([System.Windows.Point]::new([double]$rect.X, [double]$rect.Y), $CaretCanvas)
+      [System.Windows.Controls.Canvas]::SetLeft($BlockCaret, [double]$pt.X)
+      [System.Windows.Controls.Canvas]::SetTop($BlockCaret,  [double]$pt.Y)
+      $BlockCaret.Height = [double]$rect.Height
+    }
+  } catch {}
+}
+$TickerBox.Add_TextChanged({ Update-BlockCaret })
+$TickerBox.Add_SelectionChanged({ Update-BlockCaret })
+$TickerBox.Add_SizeChanged({ Update-BlockCaret })
+$window.Add_ContentRendered({ Update-BlockCaret })
+# Focus the input when the window shows
+$window.Add_SourceInitialized({ $TickerBox.Focus() })
+
+# Custom title bar behavior: drag, minimize, close
+if ($TitleBar) {
+  $TitleBar.Add_MouseLeftButtonDown({ param($s,$e) try { $window.DragMove() } catch {} })
+}
+if ($MinBtn)   { $MinBtn.Add_Click({ $window.WindowState = 'Minimized' }) }
+if ($CloseBtn) { $CloseBtn.Add_Click({ $window.Close() }) }
+
+# Uppercase & strip spaces live
+$TickerBox.Add_TextChanged({
+  $TickerBox.Text = ($TickerBox.Text -replace '\s','').ToUpper()
+  $TickerBox.CaretIndex = $TickerBox.Text.Length
+})
+
+# Watch Firefox windows: when one closes, refocus the next window below
+$script:LastFxCount = 0
+$WindowWatchTimer = New-Object System.Windows.Threading.DispatcherTimer
+$WindowWatchTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+$WindowWatchTimer.Add_Tick({
+  try {
+    Ensure-Win32Helpers
+    $current = (Get-FirefoxWindows).Count
+    if ($script:LastFxCount -gt $current -and $current -gt 0) {
+      # A Firefox window closed; bring the next one to foreground
+      Focus-TopFirefoxWindow | Out-Null
+    }
+    $script:LastFxCount = $current
+  } catch {}
+})
+# Start this watcher lazily after first Firefox window is opened
+
+# Defer loading large ticker CSVs until after the window first renders
+$DelayedLoadTimer = New-Object System.Windows.Threading.DispatcherTimer
+$DelayedLoadTimer.Interval = [TimeSpan]::FromMilliseconds(800)
+$DelayedLoadTimer.Add_Tick({
+  try {
+    $script:DeferTickerLoad = $false
+    Load-Tickers
+    # Rebuild rain with the full ticker pool once loaded
+    Init-DigitalRain
+  } catch {}
+  $DelayedLoadTimer.Stop()
+})
+$window.Add_ContentRendered({ $DelayedLoadTimer.Start() })
+
+# ========== Digital Rain ==========
+$script:RainTimer   = $null
+$script:RainStreams = @()
+$script:Tickers     = @()
+if (-not $script:RainDensity) { $script:RainDensity = 4 }  # 1=normal, higher=more columns
+
+function New-RandomChar {
+  $chars = '01ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+  return $chars[(Get-Random -Minimum 0 -Maximum $chars.Length)]
+}
+
+function New-StreamText([int]$length) {
+  $sb = New-Object System.Text.StringBuilder
+  for ($i=0; $i -lt $length; $i++) {
+    [void]$sb.Append((New-RandomChar))
+    if ($i -lt $length-1) { [void]$sb.Append("`n") }
+  }
+  return $sb.ToString()
+}
+
+function Convert-CsvTextToTickers([string]$csv) {
+  $result = New-Object System.Collections.Generic.List[string]
+  if (-not $csv) { return @() }
+  try {
+    $rows = $csv | ConvertFrom-Csv
+    foreach ($r in $rows) {
+      $sym = $null
+      foreach ($k in 'Symbol','Ticker','symbol','ticker','Code','code','SYM','sym') {
+        if ($r.PSObject.Properties.Name -contains $k) { $sym = [string]$r.$k; break }
+      }
+      if (-not $sym) {
+        # If CSV is single-column without header, treat the whole row text as symbol
+        $text = ($r | Out-String).Trim()
+        if ($text -and -not ($text -like '*=*')) { $sym = $text }
+      }
+      if ($sym) { $result.Add($sym.Trim().ToUpper()) }
+    }
+  } catch {}
+  # Deduplicate and filter obvious junk
+  return ($result | Where-Object { $_ -match '^[A-Z\.]\{1,6\}$' } | Select-Object -Unique)
+}
+
+function Convert-CsvTextToTickersFixed([string]$csv) {
+  $result = New-Object System.Collections.Generic.List[string]
+  if (-not $csv) { return @() }
+  try {
+    $rows = $csv | ConvertFrom-Csv
+    foreach ($r in $rows) {
+      $sym = $null
+      foreach ($k in 'Symbol','Ticker','symbol','ticker','Code','code','SYM','sym') {
+        if ($r.PSObject.Properties.Name -contains $k) { $sym = [string]$r.$k; break }
+      }
+      if (-not $sym) {
+        $text = ($r | Out-String).Trim()
+        if ($text -and -not ($text -like '*=*')) { $sym = $text }
+      }
+      if ($sym) { $result.Add($sym.Trim().ToUpper()) }
+    }
+  } catch {}
+  return ($result | Where-Object { $_ -match '^[A-Z\.]{1,6}$' } | Select-Object -Unique)
+}
+
+function Load-Tickers {
+  if ($script:Sp500Tickers -and $script:Sp500Tickers.Count -gt 0 -and
+      $script:AllTickers  -and $script:AllTickers.Count  -gt 0) { return }
+
+  # Fast-start path: quickly load SP500 only (small) so UI opens fast with many uniques,
+  # then a background task will load all_us_stocks and refresh.
+  if ($script:DeferTickerLoad) {
+    try {
+      $desktop = [Environment]::GetFolderPath('Desktop')
+      $spPath  = Join-Path $desktop 'SP500.csv'
+      $sp = @()
+      if (Test-Path $spPath) {
+        $sp = Convert-CsvTextToTickersFixed (Get-Content -Raw -LiteralPath $spPath)
+      }
+      if (-not $sp -or $sp.Count -lt 10) {
+        $sp = @('AAPL','MSFT','GOOGL','AMZN','NVDA','META','TSLA','BRK.B','UNH','XOM','JNJ','JPM','V','PG')
+      }
+      $script:Sp500Tickers = $sp
+      $script:AllTickers   = $sp
+      $script:Tickers      = ($sp | Select-Object -Unique)
+    } catch {
+      if (-not $script:Sp500Tickers -or $script:Sp500Tickers.Count -eq 0) {
+        $script:Sp500Tickers = @('AAPL','MSFT','GOOGL','AMZN','NVDA','META','TSLA','BRK.B','UNH','XOM','JNJ','JPM','V','PG')
+      }
+      $script:AllTickers = $script:Sp500Tickers
+      $script:Tickers    = ($script:Sp500Tickers | Select-Object -Unique)
+    }
+    return
+  }
+
+  $desktop = [Environment]::GetFolderPath('Desktop')
+  $spPath  = Join-Path $desktop 'SP500.csv'
+  $allPath = Join-Path $desktop 'all_us_stocks.csv'
+
+  $sp  = @()
+  $all = @()
+
+  if (Test-Path $spPath)  { $sp  = Convert-CsvTextToTickersFixed (Get-Content -Raw -LiteralPath $spPath) }
+  if (Test-Path $allPath) { $all = Convert-CsvTextToTickersFixed (Get-Content -Raw -LiteralPath $allPath) }
+
+  # Fallback minimal list if files missing or empty
+  if (-not $sp  -or $sp.Count  -lt 10) { $sp  = @('AAPL','MSFT','GOOGL','AMZN','NVDA','META','TSLA','BRK.B','UNH','XOM','JNJ','JPM','V','PG') }
+  if (-not $all -or $all.Count -lt 10) { $all = @('AAPL','MSFT','GOOGL','AMZN','NVDA','META','TSLA','BRK.B','UNH','XOM','JNJ','JPM','V','PG') }
+
+  $script:Sp500Tickers = $sp
+  $script:AllTickers   = $all
+  # Keep combined list for any other usage
+  $script:Tickers = ($sp + $all | Select-Object -Unique)
+}
+
+function Get-RandomTicker {
+  if (-not $script:Sp500Tickers -or -not $script:AllTickers) { Load-Tickers }
+  if (($script:Sp500Tickers.Count -eq 0) -and ($script:AllTickers.Count -eq 0)) { return (New-RandomChar) }
+
+  # 80% from SP500.csv, 20% from all_us_stocks.csv
+  $pick = Get-Random -Minimum 0 -Maximum 100
+  if ($script:Sp500Tickers.Count -eq 0) {
+    return $script:AllTickers[(Get-Random -Minimum 0 -Maximum $script:AllTickers.Count)]
+  } elseif ($script:AllTickers.Count -eq 0) {
+    return $script:Sp500Tickers[(Get-Random -Minimum 0 -Maximum $script:Sp500Tickers.Count)]
+  } elseif ($pick -lt 80) {
+    return $script:Sp500Tickers[(Get-Random -Minimum 0 -Maximum $script:Sp500Tickers.Count)]
+  } else {
+    return $script:AllTickers[(Get-Random -Minimum 0 -Maximum $script:AllTickers.Count)]
+  }
+}
+
+function New-StreamTickers([int]$length) {
+  # Build a vertical stack of full tickers (one per line)
+  Load-Tickers
+  $sb = New-Object System.Text.StringBuilder
+  for ($i=0; $i -lt $length; $i++) {
+    [void]$sb.Append((Get-RandomTicker))
+    if ($i -lt $length-1) { [void]$sb.Append("`n") }
+  }
+  return $sb.ToString()
+}
+
+# Global set to enforce on-screen uniqueness of tickers
+if (-not $script:UsedTickers) {
+  $script:UsedTickers = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+}
+
+function Get-UniqueRandomTicker {
+  Load-Tickers
+  if (-not $script:UsedTickers) {
+    $script:UsedTickers = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  }
+  # Try random sampling a few times for speed
+  for ($i=0; $i -lt 80; $i++) {
+    $t = Get-RandomTicker
+    if ($t -and $script:UsedTickers.Add($t)) { return $t }
+  }
+  # Fallback: scan merged list
+  foreach ($t in $script:Tickers) {
+    if ($t -and $script:UsedTickers.Add($t)) { return $t }
+  }
+  return $null
+}
+
+# Create simple per-line UI for a stream: a vertical StackPanel of TextBlocks.
+# Applies an extremely bright green glow to ~5% of lines at creation/reset.
+function Apply-StreamTickersUI([System.Windows.Controls.StackPanel]$panel, [int]$length, [double]$fontSize, [int]$glowPercent = 5) {
+  if (-not $panel) { return @() }
+  $panel.Children.Clear()
+  $lines = @()
+  for ($i=0; $i -lt $length; $i++) {
+    $t = Get-UniqueRandomTicker
+    if (-not $t) { break }
+    $lbl = New-Object System.Windows.Controls.TextBlock
+    $lbl.FontFamily = 'Consolas'
+    $lbl.FontSize   = $fontSize
+    $lbl.Text       = $t
+    if ($t) { [void]$script:UsedTickers.Add($t) }
+    $lbl.TextAlignment = 'Left'
+    $lbl.Foreground = $script:BrushDim
+
+    # 5% chance: apply extremely bright neon glow
+    if ((Get-Random -Minimum 0 -Maximum 100) -lt $glowPercent) {
+      $lbl.Foreground = $script:BrushBright
+      $glow = New-Object System.Windows.Media.Effects.DropShadowEffect
+      $glow.BlurRadius  = 80
+      $glow.ShadowDepth = 0
+      $glow.Color       = [System.Windows.Media.Color]([System.Windows.Media.ColorConverter]::ConvertFromString('#00FF66'))
+      $glow.Opacity     = 1.0
+      try { $glow.RenderingBias = [System.Windows.Media.Effects.RenderingBias]::Performance } catch {}
+      try { if ($glow.CanFreeze) { $glow.Freeze() } } catch {}
+      $lbl.Effect       = $glow
+    }
+
+    [void]$panel.Children.Add($lbl)
+    $lines += ,$lbl
+  }
+  return ,$lines
+}
+
+function Init-DigitalRain {
+  if (-not $DigitalRain) { return }
+  $DigitalRain.Children.Clear()
+  $script:RainStreams = @()
+  # Reset uniqueness tracking
+  if (-not $script:UsedTickers) {
+    $script:UsedTickers = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  } else {
+    $script:UsedTickers.Clear()
+  }
+
+  $w = [double]$DigitalRain.ActualWidth
+  $h = [double]$DigitalRain.ActualHeight
+  if ($w -le 0) { $w = [double]$window.ActualWidth }
+  if ($h -le 0) { $h = [double]$window.ActualHeight }
+  if ($w -le 0 -or $h -le 0) { return }
+
+  Load-Tickers
+  $fontSize  = 16.0
+  # Non-overlap, edge-aligned column layout
+  $tickerMaxLen = 6.0
+  $charFactor   = 0.62
+  $lineH        = 18.0
+  $maxScale        = 1.35
+  $maxStreamWidth  = [double][Math]::Ceiling(($fontSize * $maxScale * $charFactor * $tickerMaxLen) + 8.0)
+  $stepX           = [double]$maxStreamWidth
+  $overscan         = [double]$script:HorizOverscan
+  $extraRightCols   = [int]([Math]::Max(0, [int]$script:ExtraRightColumns))
+  $rightEdgeExtra   = [double]$script:RightEdgeExtra
+  $extraLeftCols    = [int]([Math]::Max(0, [int]$script:ExtraLeftColumns))
+  $leftEdgeExtra    = [double]$script:LeftEdgeExtra
+  # Compute base columns using overscan so base first/last columns can extend beyond edges
+  $colsBase         = [int][Math]::Ceiling((($w + (2.0 * $overscan)) / $stepX))
+  if ($colsBase -lt 1) { $colsBase = 1 }
+  if ($script:MaxRainStreams -gt 0) {
+    $maxBase = [int]$script:MaxRainStreams - $extraRightCols - $extraLeftCols
+    if ($maxBase -lt 1) { $maxBase = 1 }
+    if ($colsBase -gt $maxBase) { $colsBase = $maxBase }
+  }
+  $cols = [int]($colsBase + $extraLeftCols + $extraRightCols)
+
+  for ($i=0; $i -lt $cols; $i++) {
+    # Mixed lengths: most short, some long
+    $lenPick = Get-Random -Minimum 0 -Maximum 100
+    if ($lenPick -lt 70) {
+      $len = Get-Random -Minimum 5 -Maximum 12
+    } else {
+      $len = Get-Random -Minimum 16 -Maximum 28
+    }
+    $tb    = New-Object System.Windows.Controls.StackPanel
+    $tb.Orientation = 'Vertical'
+    $streamFontSize = $fontSize
+    # Randomly enlarge some columns
+    $sizeRoll = Get-Random -Minimum 0 -Maximum 100
+    if ($sizeRoll -lt 20) {
+      $streamFontSize = [double]$fontSize * 1.35
+    } elseif ($sizeRoll -lt 40) {
+      $streamFontSize = [double]$fontSize * 1.2
+    }
+    # Populate with one TextBlock per ticker line and 5% glow
+    $linesUI = Apply-StreamTickersUI -panel $tb -length $len -fontSize $streamFontSize -glowPercent 5
+
+    # Fixed non-overlap placement using base index (ignores extra-left cells)
+    $baseIndex = [int]($i - $extraLeftCols)
+    $baseX = [double](-1.0 * $overscan + ($baseIndex * $stepX))
+    $streamWidth = [double][Math]::Ceiling(($streamFontSize * $charFactor * $tickerMaxLen) + 8.0)
+    $candX = [double]($baseX + (($stepX - $streamWidth) / 2.0))
+
+    $isExtraLeft  = ($i -lt $extraLeftCols)
+    $isExtraRight = ($i -ge ($extraLeftCols + $colsBase))
+    $isFirstBase  = ($baseIndex -eq 0)
+    $isLastBase   = ($baseIndex -eq ($colsBase - 1))
+
+    if     ($isExtraLeft)  { $candX = [double](-1.0 * ($streamWidth + $overscan + $leftEdgeExtra)) }
+    elseif ($isFirstBase)  { $candX = 0.0 }
+    elseif ($isExtraRight) { $candX = [double](($w - $streamWidth) + $overscan + $rightEdgeExtra) }
+    elseif ($isLastBase)   { $candX = [double](($w - $streamWidth) + $overscan) }
+
+    $minX = -1.0 * $overscan
+    $maxX = [double](($w - $streamWidth) + $overscan)
+    if ($isExtraRight) { $maxX = [double]($maxX + $rightEdgeExtra) }
+    if ($isExtraLeft)  { $minX = [double]($minX - $leftEdgeExtra - $streamWidth) }
+    if ($candX -lt $minX) { $candX = $minX }
+    if ($candX -gt $maxX) { $candX = $maxX }
+    [System.Windows.Controls.Canvas]::SetLeft($tb, [double]$candX)
+
+    # Initial placement: optionally prefill across the visible area so screen looks busy immediately
+    $lineHScale   = [double]$lineH / [double]$fontSize
+    $streamLineH  = [double]$streamFontSize * $lineHScale
+    $streamHeight = [double]$streamLineH * [double]$len
+    if ($script:PrefillVisible) {
+      $range = [double]($h + $streamHeight)
+      $y = [double](-1 * $streamHeight + (Get-Random -Minimum 0 -Maximum ([int]$range)))
+    } else {
+      # Spawn fully above the top by at least full stream height (respect per-stream font size)
+      $y = -1 * ($streamHeight + (Get-Random -Minimum 0 -Maximum ([int]($h * 0.5))))
+    }
+    [System.Windows.Controls.Canvas]::SetTop($tb, [double]$y)
+
+    [void]$DigitalRain.Children.Add($tb)
+
+    $actualLines = [int]$linesUI.Count
+    $stream = [pscustomobject]@{
+      TB     = $tb
+      X      = [double]$candX
+      Y      = [double]$y
+      Len    = [int]$actualLines
+      # Faster overall speeds to reduce dead space
+      Speed  = (Get-Random -Minimum 0.8 -Maximum 4.2)
+      LineH  = $streamLineH
+      Mutate = 0
+      FontSize = [double]$streamFontSize
+      Lines  = $linesUI
+    }
+    $script:RainStreams += ,$stream
+  }
+
+  if ($script:RainTimer) { $script:RainTimer.Stop() }
+  $script:RainTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:RainTimer.Interval = [TimeSpan]::FromMilliseconds(16)  # ~60 FPS target
+  $script:RainTimer.Add_Tick({ Update-DigitalRain })
+  $script:RainTimer.Start()
+}
+
+function Update-DigitalRain {
+  try {
+    $h = [double]$DigitalRain.ActualHeight
+    if ($h -le 0) { $h = [double]$window.ActualHeight }
+    foreach ($s in $script:RainStreams) {
+      $s.Y += $s.Speed
+      if ($s.Y -lt ($h + ($s.Len * $s.LineH))) {
+        [System.Windows.Controls.Canvas]::SetTop($s.TB, [double]$s.Y)
+      } else {
+        # Mixed lengths on reset: most short, some long
+        $lenRoll  = Get-Random -Minimum 0 -Maximum 100
+        if ($lenRoll -lt 70) {
+          $tickers = Get-Random -Minimum 5 -Maximum 12
+        } else {
+          $tickers = Get-Random -Minimum 16 -Maximum 28
+        }
+        # Release this stream's current tickers from the global set before repopulating
+        try {
+          if ($s.Lines) {
+            foreach ($lbl in $s.Lines) {
+              if ($lbl -and $lbl.Text) { [void]$script:UsedTickers.Remove($lbl.Text) }
+            }
+          }
+        } catch {}
+        $newLines = Apply-StreamTickersUI -panel $s.TB -length $tickers -fontSize $s.FontSize -glowPercent 5
+        $s.Len     = [int]$newLines.Count
+        $s.Lines   = $newLines
+        $s.Speed = (Get-Random -Minimum 0.8 -Maximum 4.2)
+        # Ensure full off-screen spawn so they always enter from top
+        $streamHeight = [double]$s.LineH * [double]$s.Len
+        $s.Y     = -1 * ($streamHeight + (Get-Random -Minimum 0 -Maximum ([int]($h * 0.5))))
+        [System.Windows.Controls.Canvas]::SetTop($s.TB, [double]$s.Y)
+      }
+
+      $s.Mutate++
+      if ($s.Mutate -ge 5) {
+        $s.Mutate = 0
+        $lines = $s.Lines
+        if ($lines -and $lines.Count -gt 0) {
+          # Only mutate non-glowing lines so glowing tickers stay constant
+          $mutable = @($lines | Where-Object { $_.Effect -eq $null })
+          if ($mutable.Count -gt 0) {
+          $idx = Get-Random -Minimum 0 -Maximum $mutable.Count
+          $lbl = $mutable[$idx]
+          if ($lbl) {
+            $old = $lbl.Text
+            if ($old) { [void]$script:UsedTickers.Remove($old) }
+            $new = Get-UniqueRandomTicker
+            if ($new) {
+              $lbl.Text = $new
+            } else {
+              if ($old) { [void]$script:UsedTickers.Add($old) }
+            }
+          }
+          }
+        }
+      }
+    }
+  } catch {}
+}
+
+$window.Add_ContentRendered({ Init-DigitalRain })
+$window.Add_SizeChanged({ Init-DigitalRain })
+$window.Add_Closed({ if ($script:RainTimer) { $script:RainTimer.Stop() } })
+
+function Open-Tabs([string]$Ticker) {
+  if ($Ticker -notmatch '^[A-Z0-9]{1,10}$') {
+    [System.Windows.MessageBox]::Show("Use 1-10 letters/numbers.","Invalid Ticker",'OK','Warning') | Out-Null
+    return
+  }
+
+  # Always open a new window, then add background tabs to that window
+  $y = ("https://finance.yahoo.com/quote/{0}" -f $Ticker)
+  $z = ("https://www.zacks.com/stock/quote/{0}" -f $Ticker)
+  $f = ("https://finviz.com/quote.ashx?t={0}" -f $Ticker)
+
+  # Create the new window first (Yahoo focused)
+  & $Firefox -P StockOpener -new-window $y
+  Start-Sleep -Milliseconds 600
+
+  # Then add the two tabs; they should land in the active (new) window
+  & $Firefox -P StockOpener -new-tab $z
+  Start-Sleep -Milliseconds 200
+  & $Firefox -P StockOpener -new-tab $f
+
+  # Finally bring that window to the foreground
+  Start-Sleep -Milliseconds 250
+  Focus-FirefoxWindow $Ticker
+  
+  # Start window watcher after we actually have Firefox windows
+  try {
+    if ($WindowWatchTimer -and -not $WindowWatchTimer.IsEnabled) { $WindowWatchTimer.Start() }
+  } catch {}
+}
+
+# Enter opens; Esc clears
+$TickerBox.Add_PreviewKeyDown({
+  param($s,$e)
+  if ($e.Key -eq 'Return' -or $e.Key -eq 'Enter') {
+    $t = $TickerBox.Text.Trim()
+    if ($t) { Open-Tabs $t; $TickerBox.Clear() }
+    $e.Handled = $true
+  } elseif ($e.Key -eq 'Escape') {
+    $TickerBox.Clear()
+    $e.Handled = $true
+  }
+})
+
+# Button click does the same as Enter
+$OpenBtn.Add_Click({
+  $t = $TickerBox.Text.Trim()
+  if ($t) { Open-Tabs $t; $TickerBox.Clear() }
+})
+
+# Show the window (modal)
+$null = $window.ShowDialog()
